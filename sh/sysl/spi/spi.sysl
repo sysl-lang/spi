@@ -120,7 +120,7 @@ impl[B: Bus,C: ChipSelect] Device for Exclusive[B,C]
         flushed?
         unlocked?
         Ok(value)
-    override read(*self, out: []u8, fill: u8 = 0xff) -> Result[unit,Error]
+    override read(*self, out: []u8, fill: u8) -> Result[unit,Error]
         if self.active then return self.bus.read(out,fill)
         begin(self)?
         val result = self.bus.read(out,fill)
