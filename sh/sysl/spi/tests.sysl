@@ -10,12 +10,12 @@ struct TestBus
     flushed: bool
     hz: u32
 impl Bus for TestBus
-    acquire(*self) -> Result[unit,Error]
+    override acquire(*self) -> Result[unit,Error]
         assert(!self.locked)
         self.locked = true
         self.acquired += 1
         Ok(())
-    release(*self) -> Result[unit,Error]
+    override release(*self) -> Result[unit,Error]
         assert(self.locked)
         self.locked = false
         self.released += 1
@@ -29,7 +29,7 @@ impl Bus for TestBus
         assert(self.locked)
         self.count += 1
         if self.failed then Err(Error.Io) else Ok(byte ^ 0xff)
-    flush(*self) -> Result[unit,Error]
+    override flush(*self) -> Result[unit,Error]
         self.flushed = true
         if self.failed then Err(Error.Timeout) else Ok(())
 struct TestPin

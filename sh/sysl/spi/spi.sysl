@@ -120,7 +120,7 @@ impl[B: Bus,C: ChipSelect] Device for Exclusive[B,C]
         flushed?
         unlocked?
         Ok(value)
-    read(*self, out: []u8, fill: u8 = 0xff) -> Result[unit,Error]
+    override read(*self, out: []u8, fill: u8 = 0xff) -> Result[unit,Error]
         if self.active then return self.bus.read(out,fill)
         begin(self)?
         val result = self.bus.read(out,fill)
@@ -130,10 +130,21 @@ impl[B: Bus,C: ChipSelect] Device for Exclusive[B,C]
         flushed?
         unlocked?
         Ok(())
-    write(*self, data: []const u8) -> Result[unit,Error]
+    override write(*self, data: []const u8) -> Result[unit,Error]
         if self.active then return self.bus.write(data)
         begin(self)?
         val result = self.bus.write(data)
+        val flushed = self.bus.flush()
+        val unlocked = self.bus.release()
+        result?
+        flushed?
+        unlocked?
+        Ok(())
+    override transfer(*self, data: []const u8, out: []u8) -> Result[unit,Error]
+        if data.len != out.len then return Err(Error.BadLength)
+        if self.active then return self.bus.transfer(data,out)
+        begin(self)?
+        val result = self.bus.transfer(data,out)
         val flushed = self.bus.flush()
         val unlocked = self.bus.release()
         result?
