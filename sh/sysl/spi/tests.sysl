@@ -1,0 +1,83 @@
+module sh.sysl.spi
+@tests
+
+struct TestBus
+    locked: bool
+    count: int
+    acquired: int
+    released: int
+    failed: bool
+    flushed: bool
+    hz: u32
+impl Bus for TestBus
+    acquire(*self) -> Result[unit,Error]
+        assert(!self.locked)
+        self.locked = true
+        self.acquired += 1
+        Ok(())
+    release(*self) -> Result[unit,Error]
+        assert(self.locked)
+        self.locked = false
+        self.released += 1
+        Ok(())
+    configure(*self, config: Config) -> Result[unit,Error]
+        assert(self.locked)
+        if config.hz == 0 then return Err(Error.Configuration)
+        self.hz = config.hz
+        Ok(())
+    exchange(*self, byte: u8) -> Result[u8,Error]
+        assert(self.locked)
+        self.count += 1
+        if self.failed then Err(Error.Io) else Ok(byte ^ 0xff)
+    flush(*self) -> Result[unit,Error]
+        self.flushed = true
+        if self.failed then Err(Error.Timeout) else Ok(())
+struct TestPin
+    active: bool
+impl ChipSelect for TestPin
+    set_active(*self, active: bool) -> Result[unit,Error]
+        self.active = active
+        Ok(())
+private device() -> Exclusive[TestBus,TestPin] = exclusive(TestBus(false,0,0,0,false,false,0),TestPin(false),config(1000000))
+
+@test("SPI device: complete CS span owns the bus and restores its configuration")
+selected()
+    var d = device()
+    d.select(true).unwrap()
+    assert(d.active && d.cs.active && d.bus.locked && d.bus.acquired == 1)
+    d.select(true).unwrap()
+    assert(d.exchange(0xaa) == Ok(0x55))
+    var out: [3]u8
+    d.read(out[..],0x55).unwrap()
+    assert(out == [0xaau8,0xaa,0xaa] && d.bus.acquired == 1)
+    assert(d.configure(config(2000000)) == Err(Error.Busy))
+    d.select(false).unwrap()
+    assert(!d.active && !d.cs.active && !d.bus.locked && d.bus.flushed)
+    d.configure(config(2000000)).unwrap()
+    d.select(true).unwrap()
+    assert(d.bus.hz == 2000000)
+    d.select(false).unwrap()
+
+@test("SPI device: deselected clocks and bulk writes arbitrate without asserting CS")
+deselected()
+    var d = device()
+    assert(d.exchange(0xff) == Ok(0))
+    d.write([1u8,2,3]).unwrap()
+    assert(d.bus.count == 4 && d.bus.acquired == 2 && d.bus.released == 2 && !d.cs.active)
+    var out: [2]u8
+    assert(d.transfer([1u8],out[..]) == Err(Error.BadLength))
+    assert(d.bus.count == 4)
+    d.transfer([0xf0u8,0x0f],out[..]).unwrap()
+    assert(out == [0x0fu8,0xf0])
+
+@test("SPI device: transaction and deselected failures release pin and bus")
+failures()
+    var d = device()
+    d.bus.failed = true
+    assert(d.exchange(0) == Err(Error.Io) && !d.bus.locked)
+    d.select(true).unwrap()
+    assert(d.exchange(0) == Err(Error.Io))
+    assert(d.select(false) == Err(Error.Timeout))
+    assert(!d.cs.active && !d.bus.locked && !d.active)
+    d.bus.failed = false
+    assert(d.configure(config(0)) == Err(Error.Configuration))

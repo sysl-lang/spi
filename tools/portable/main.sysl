@@ -1,0 +1,20 @@
+@no_alloc
+import sh.sysl.spi.{Bus,Device,ChipSelect,Config,Error,exclusive,config}
+extern "spi_probe_byte" exchange(byte: u8) -> u8
+struct Port
+end Port
+impl Bus for Port
+    configure(*self, cfg: Config) -> Result[unit,Error] = Ok(())
+    exchange(*self, byte: u8) -> Result[u8,Error] = Ok(exchange(byte))
+struct Pin
+end Pin
+impl ChipSelect for Pin
+    set_active(*self, active: bool) -> Result[unit,Error] = Ok(())
+@export("spi_probe")
+probe() -> int
+    var d = exclusive(Port(),Pin(),config(1000000))
+    if d.select(true).is_err() then return 1
+    var bytes: [8]u8
+    if d.read(bytes[..]).is_err() || d.write(bytes[..]).is_err() then return 2
+    if d.select(false).is_err() then return 3
+    0

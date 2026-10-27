@@ -1,0 +1,142 @@
+module sh.sysl.spi
+@no_alloc
+
+enum Error derives Display
+    Io
+    Timeout
+    Configuration
+    Busy
+    BadLength
+
+enum Mode
+    Mode0
+    Mode1
+    Mode2
+    Mode3
+
+enum BitOrder
+    MsbFirst
+    LsbFirst
+
+struct Config derives Eq
+    hz: u32
+    mode: Mode
+    order: BitOrder
+
+config(hz: u32, mode: Mode = Mode.Mode0, order: BitOrder = BitOrder.MsbFirst) -> Config = Config(hz,mode,order)
+
+// Eight-bit full duplex. Platforms select a rate no greater than config.hz,
+// reject unsupported settings, bound their hardware waits, and drain received
+// data even for writes. Bulk overrides can use DMA; caller buffers remain valid
+// only until the callback returns. No OS, allocator or locking policy is implied.
+trait Bus
+    configure(*self, config: Config) -> Result[unit,Error]
+    exchange(*self, byte: u8) -> Result[u8,Error]
+    flush(*self) -> Result[unit,Error] = Ok(())
+    // Shared hardware handles override these with bounded platform arbitration.
+    acquire(*self) -> Result[unit,Error] = Ok(())
+    release(*self) -> Result[unit,Error] = Ok(())
+    read(*self, out: []u8, fill: u8 = 0xff) -> Result[unit,Error]
+        for i in 0..<out.len do out[i] = self.exchange(fill)?
+        Ok(())
+    write(*self, data: []const u8) -> Result[unit,Error]
+        for byte in data do self.exchange(byte)?
+        Ok(())
+    transfer(*self, data: []const u8, out: []u8) -> Result[unit,Error]
+        if data.len != out.len then return Err(Error.BadLength)
+        for i in 0..<data.len do out[i] = self.exchange(data[i])?
+        Ok(())
+
+trait ChipSelect
+    set_active(*self, active: bool) -> Result[unit,Error]
+
+// A selected device transaction lasts from select(true) to select(false), not
+// merely one byte. exchange while deselected is intentionally permitted: SD
+// initialization and release clocks require it. Implementations must arbitrate
+// those clocks too. Device configuration is retained independently of its bus.
+trait Device
+    configure(*self, config: Config) -> Result[unit,Error]
+    select(*self, active: bool) -> Result[unit,Error]
+    exchange(*self, byte: u8) -> Result[u8,Error]
+    read(*self, out: []u8, fill: u8 = 0xff) -> Result[unit,Error]
+        for i in 0..<out.len do out[i] = self.exchange(fill)?
+        Ok(())
+    write(*self, data: []const u8) -> Result[unit,Error]
+        for byte in data do self.exchange(byte)?
+        Ok(())
+    transfer(*self, data: []const u8, out: []u8) -> Result[unit,Error]
+        if data.len != out.len then return Err(Error.BadLength)
+        for i in 0..<data.len do out[i] = self.exchange(data[i])?
+        Ok(())
+
+struct Exclusive[B: Bus,C: ChipSelect]
+    private[spi] bus: B
+    private[spi] cs: C
+    private[spi] config: Config
+    private[spi] active: bool
+
+// CS must initially be inactive. Shared Bus handles must synchronize access to
+// the underlying hardware; the defaults suit an exclusively owned controller.
+exclusive[B: Bus,C: ChipSelect](bus: B, cs: C, config: Config) -> Exclusive[B,C] = Exclusive(bus,cs,config,false)
+
+private begin[B: Bus,C: ChipSelect](d: *Exclusive[B,C]) -> Result[unit,Error]
+    d.bus.acquire()?
+    val result = d.bus.configure(d.config)
+    if result.is_err() then d.bus.release()
+    result
+
+impl[B: Bus,C: ChipSelect] Device for Exclusive[B,C]
+    configure(*self, config: Config) -> Result[unit,Error]
+        if self.active then return Err(Error.Busy)
+        if config.hz == 0 then return Err(Error.Configuration)
+        self.config = config
+        Ok(())
+    select(*self, active: bool) -> Result[unit,Error]
+        if active
+            if self.active then return Ok(())
+            begin(self)?
+            val result = self.cs.set_active(true)
+            if result.is_err() then self.bus.release()
+            result?
+            self.active = true
+            return Ok(())
+        if !self.active
+            begin(self)?
+        val flushed = self.bus.flush()
+        val pin = self.cs.set_active(false)
+        if pin.is_ok() then self.active = false
+        val unlocked = self.bus.release()
+        flushed?
+        pin?
+        unlocked?
+        Ok(())
+    exchange(*self, byte: u8) -> Result[u8,Error]
+        if self.active then return self.bus.exchange(byte)
+        begin(self)?
+        val result = self.bus.exchange(byte)
+        val flushed = self.bus.flush()
+        val unlocked = self.bus.release()
+        val value = result?
+        flushed?
+        unlocked?
+        Ok(value)
+    read(*self, out: []u8, fill: u8 = 0xff) -> Result[unit,Error]
+        if self.active then return self.bus.read(out,fill)
+        begin(self)?
+        val result = self.bus.read(out,fill)
+        val flushed = self.bus.flush()
+        val unlocked = self.bus.release()
+        result?
+        flushed?
+        unlocked?
+        Ok(())
+    write(*self, data: []const u8) -> Result[unit,Error]
+        if self.active then return self.bus.write(data)
+        begin(self)?
+        val result = self.bus.write(data)
+        val flushed = self.bus.flush()
+        val unlocked = self.bus.release()
+        result?
+        flushed?
+        unlocked?
+        Ok(())
