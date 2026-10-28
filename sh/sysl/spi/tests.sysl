@@ -32,55 +32,103 @@ impl Bus for TestBus
     override flush(*self) -> Result[unit,Error]
         self.flushed = true
         if self.failed then Err(Error.Timeout) else Ok(())
+private test_bus() -> TestBus = TestBus(locked = false, count = 0, acquired = 0, released = 0, failed = false, flushed = false, hz = 0)
 struct TestPin
     active: bool
 impl ChipSelect for TestPin
     set_active(*self, active: bool) -> Result[unit,Error]
         self.active = active
         Ok(())
-private device() -> Exclusive[TestBus,TestPin] = exclusive(TestBus(false,0,0,0,false,false,0),TestPin(false),config(1000000))
+private test_device() -> CsDevice[TestBus,TestPin] = device(test_bus(),TestPin(false),config(1000000))
 
 @test("SPI device: complete CS span owns the bus and restores its configuration")
 selected()
-    var d = device()
-    d.select(true).unwrap()
+    var d = test_device()
+    d.select().unwrap()
     assert(d.active && d.cs.active && d.bus.locked && d.bus.acquired == 1)
-    d.select(true).unwrap()
+    d.select().unwrap()
     assert(d.exchange(0xaa) == Ok(0x55))
     var out: [3]u8
     d.read(out[..],0x55).unwrap()
     assert(out == [0xaau8,0xaa,0xaa] && d.bus.acquired == 1)
     assert(d.configure(config(2000000)) == Err(Error.Busy))
-    d.select(false).unwrap()
+    d.deselect().unwrap()
     assert(!d.active && !d.cs.active && !d.bus.locked && d.bus.flushed)
     d.configure(config(2000000)).unwrap()
-    d.select(true).unwrap()
+    d.select().unwrap()
     assert(d.bus.hz == 2000000)
-    d.select(false).unwrap()
+    d.deselect().unwrap()
 
 @test("SPI device: deselected clocks and bulk writes arbitrate without asserting CS")
-deselected()
-    var d = device()
+deselected_calls()
+    var d = test_device()
     assert(d.exchange(0xff) == Ok(0))
     d.write([1u8,2,3]).unwrap()
     assert(d.bus.count == 4 && d.bus.acquired == 2 && d.bus.released == 2 && !d.cs.active)
     var out: [2]u8
     assert(d.transfer([1u8],out[..]) == Err(Error.BadLength))
-    assert(d.bus.count == 4)
+    assert(d.bus.count == 4 && d.bus.acquired == 2)
     d.transfer([0xf0u8,0x0f],out[..]).unwrap()
-    assert(out == [0x0fu8,0xf0])
+    assert(out == [0x0fu8,0xf0] && d.bus.acquired == 3 && d.bus.released == 3)
+    var bytes: [2]u8
+    d.read(bytes[..],0x0f).unwrap()
+    assert(bytes == [0xf0u8,0xf0] && d.bus.acquired == 4 && d.bus.released == 4 && !d.bus.locked)
 
 @test("SPI device: transaction and deselected failures release pin and bus")
 failures()
-    var d = device()
+    var d = test_device()
     d.bus.failed = true
     assert(d.exchange(0) == Err(Error.Io) && !d.bus.locked)
-    d.select(true).unwrap()
+    var out: [2]u8
+    assert(d.read(out[..]) == Err(Error.Io) && !d.bus.locked && d.bus.released == 2)
+    assert(d.write([1u8]) == Err(Error.Io) && !d.bus.locked && d.bus.released == 3)
+    assert(d.transfer([1u8,2],out[..]) == Err(Error.Io) && !d.bus.locked && d.bus.released == 4)
+    d.select().unwrap()
     assert(d.exchange(0) == Err(Error.Io))
-    assert(d.select(false) == Err(Error.Timeout))
+    assert(d.deselect() == Err(Error.Timeout))
     assert(!d.cs.active && !d.bus.locked && !d.active)
     d.bus.failed = false
     assert(d.configure(config(0)) == Err(Error.Configuration))
+
+// The bus call succeeds and only the flush fails: the flush is reported.
+struct FlushFails
+    locked: bool
+impl Bus for FlushFails
+    override acquire(*self) -> Result[unit,Error]
+        self.locked = true
+        Ok(())
+    override release(*self) -> Result[unit,Error]
+        self.locked = false
+        Ok(())
+    configure(*self, config: Config) -> Result[unit,Error] = Ok(())
+    exchange(*self, byte: u8) -> Result[u8,Error] = Ok(byte)
+    override flush(*self) -> Result[unit,Error] = Err(Error.Timeout)
+
+@test("SPI device: a deselected call that succeeds reports a failed flush and still releases")
+flush_fails()
+    var d = device(FlushFails(false),TestPin(false),config(1000000))
+    assert(d.exchange(1) == Err(Error.Timeout) && !d.bus.locked)
+    assert(d.write([1u8]) == Err(Error.Timeout) && !d.bus.locked)
+
+struct ConfigFails
+    acquired: int
+    released: int
+impl Bus for ConfigFails
+    override acquire(*self) -> Result[unit,Error]
+        self.acquired += 1
+        Ok(())
+    override release(*self) -> Result[unit,Error]
+        self.released += 1
+        Ok(())
+    configure(*self, config: Config) -> Result[unit,Error] = Err(Error.Configuration)
+    exchange(*self, byte: u8) -> Result[u8,Error] = Ok(byte)
+
+@test("SPI device: a configuration the bus refuses releases the bus and never asserts CS")
+configure_fails()
+    var d = device(ConfigFails(0,0),TestPin(false),config(1000000))
+    assert(d.select() == Err(Error.Configuration) && !d.active && !d.cs.active)
+    assert(d.exchange(1) == Err(Error.Configuration))
+    assert(d.bus.acquired == 2 && d.bus.released == 2)
 
 struct FlakyPin
     active: bool
@@ -92,49 +140,79 @@ impl ChipSelect for FlakyPin
         if self.fail_on == self.calls then return Err(Error.Io)
         self.active = active
         Ok(())
-private flaky(fail_on: int) -> Exclusive[TestBus,FlakyPin] = exclusive(TestBus(false,0,0,0,false,false,0),FlakyPin(false,fail_on,0),config(1000000))
+private flaky(fail_on: int) -> CsDevice[TestBus,FlakyPin] = device(test_bus(),FlakyPin(false,fail_on,0),config(1000000))
 
 @test("SPI device: a failed deselect leaves the device inactive and the bus released")
 deselect_pin_fails()
     var d = flaky(2)
-    d.select(true).unwrap()
-    assert(d.select(false) == Err(Error.Io))
+    d.select().unwrap()
+    assert(d.deselect() == Err(Error.Io))
     assert(!d.active && !d.bus.locked && d.bus.acquired == 1 && d.bus.released == 1)
-    d.select(false).unwrap()
+    d.deselect().unwrap()
     assert(d.bus.acquired == 2 && d.bus.released == 2 && !d.bus.locked)
     assert(d.exchange(0xaa) == Ok(0x55))
     assert(d.bus.acquired == 3 && d.bus.released == 3 && !d.bus.locked)
-    d.select(true).unwrap()
+    d.select().unwrap()
     assert(d.active && d.bus.acquired == 4 && d.bus.locked)
-    d.select(false).unwrap()
+    d.deselect().unwrap()
     assert(!d.bus.locked && d.bus.released == 4)
 
 @test("SPI device: a failed select leaves the device inactive and the bus released")
 select_pin_fails()
     var d = flaky(1)
-    assert(d.select(true) == Err(Error.Io))
+    assert(d.select() == Err(Error.Io))
     assert(!d.active && !d.bus.locked && d.bus.acquired == 1 && d.bus.released == 1)
     assert(d.exchange(1) == Ok(0xfe))
     assert(d.bus.acquired == 2 && d.bus.released == 2)
-    d.select(true).unwrap()
+    d.select().unwrap()
     assert(d.active && d.bus.locked)
-    d.select(false).unwrap()
+    d.deselect().unwrap()
     assert(!d.bus.locked)
 
 @test("SPI device: deselecting twice acquires and releases once each time")
 double_deselect()
-    var d = device()
-    d.select(true).unwrap()
-    d.select(false).unwrap()
-    d.select(false).unwrap()
+    var d = test_device()
+    d.select().unwrap()
+    d.deselect().unwrap()
+    d.deselect().unwrap()
     assert(d.bus.acquired == 2 && d.bus.released == 2 && !d.bus.locked && !d.cs.active)
 
-// Two devices on one shared bus, each with its own pin.
+@test("SPI device: a transaction selects, runs its operation, and deselects")
+transaction_ok()
+    var d = test_device()
+    val value = d.transaction(t -> t.exchange(0x0f)).unwrap()
+    assert(value == 0xf0 && !d.active && !d.cs.active && !d.bus.locked)
+    assert(d.bus.acquired == 1 && d.bus.released == 1 && d.bus.count == 1)
+
+@test("SPI device: a failed operation still deselects, and its error wins")
+transaction_op_fails()
+    var d = test_device()
+    assert(d.transaction(t -> t.transfer([1u8],[0u8,0][..])) == Err(Error.BadLength))
+    assert(!d.active && !d.cs.active && !d.bus.locked && d.bus.released == 1)
+    d.bus.failed = true
+    assert(d.transaction(t -> t.exchange(1)) == Err(Error.Io))
+    assert(!d.active && !d.cs.active && !d.bus.locked && d.bus.released == 2)
+
+@test("SPI device: a transaction whose select fails never runs the operation")
+transaction_select_fails()
+    var d = flaky(1)
+    assert(d.transaction(t -> t.exchange(1)) == Err(Error.Io))
+    assert(!d.active && !d.bus.locked && d.bus.count == 0)
+
+@test("SPI device: a transaction whose deselect fails reports it after a good operation")
+transaction_deselect_fails()
+    var d = flaky(2)
+    assert(d.transaction(t -> t.exchange(1)) == Err(Error.Io))
+    assert(d.bus.count == 1 && !d.active && !d.bus.locked)
+
+// Two devices on one shared bus, each with its own pin. The handle is a
+// pointer to the one controller, so each device holds a copy of the pointer.
 struct SharedBus
     owner: int
     acquired: int
     released: int
     clocks: int
+    current: Config
 struct Handle
     bus: *SharedBus
     id: int
@@ -151,6 +229,7 @@ impl Bus for Handle
         Ok(())
     configure(*self, config: Config) -> Result[unit,Error]
         assert(self.bus.owner == self.id)
+        self.bus.current = config
         Ok(())
     exchange(*self, byte: u8) -> Result[u8,Error]
         assert(self.bus.owner == self.id)
@@ -159,16 +238,55 @@ impl Bus for Handle
 
 @test("SPI device: two devices share a bus and arbitrate by acquire and release")
 shared_bus()
-    var shared = SharedBus(0,0,0,0)
-    var a = exclusive(Handle(&shared,1),TestPin(false),config(1000000))
-    var b = exclusive(Handle(&shared,2),TestPin(false),config(1000000))
-    a.select(true).unwrap()
-    assert(shared.owner == 1 && b.exchange(1) == Err(Error.Busy) && b.select(true) == Err(Error.Busy))
+    var shared = SharedBus(0,0,0,0,config(1))
+    var a = device(Handle(&shared,1),TestPin(false),config(1000000))
+    var b = device(Handle(&shared,2),TestPin(false),config(1000000))
+    a.select().unwrap()
+    assert(shared.owner == 1 && b.exchange(1) == Err(Error.Busy) && b.select() == Err(Error.Busy))
     assert(!b.active && !b.cs.active && shared.owner == 1)
-    a.select(false).unwrap()
+    a.deselect().unwrap()
     assert(shared.owner == 0)
-    b.select(true).unwrap()
+    b.select().unwrap()
     assert(shared.owner == 2 && a.exchange(1) == Err(Error.Busy))
-    b.select(false).unwrap()
+    b.deselect().unwrap()
     assert(a.exchange(7) == Ok(7) && b.exchange(8) == Ok(8))
     assert(shared.owner == 0 && shared.acquired == shared.released && shared.acquired == 4 && shared.clocks == 2)
+
+@test("SPI device: each device's clock, mode and order are restored whenever it takes the shared bus")
+shared_bus_configs()
+    var shared = SharedBus(0,0,0,0,config(1))
+    val slow = config(400000,Mode.M3,BitOrder.LsbFirst)
+    val fast = config(8000000)
+    var a = device(Handle(&shared,1),TestPin(false),slow)
+    var b = device(Handle(&shared,2),TestPin(false),fast)
+    a.select().unwrap()
+    assert(shared.current == slow)
+    a.deselect().unwrap()
+    b.exchange(1).unwrap()
+    assert(shared.current == fast)
+    a.transaction(t -> t.exchange(1)).unwrap()
+    assert(shared.current == slow)
+    b.transaction(t -> t.write([1u8,2])).unwrap()
+    assert(shared.current == fast && shared.owner == 0 && shared.clocks == 4)
+
+// The README's example, as written there.
+struct Controller
+end Controller
+impl Bus for Controller
+    configure(*self, cfg: Config) -> Result[unit,Error] = Ok(())
+    exchange(*self, byte: u8) -> Result[u8,Error] = Ok(byte)
+
+struct Pin
+end Pin
+impl ChipSelect for Pin
+    set_active(*self, active: bool) -> Result[unit,Error] = Ok(())
+
+private read_id() -> Result[u8,Error]
+    var flash = device(Controller(),Pin(),config(1000000,Mode.M3))
+    flash.transaction(d ->
+        d.write([0x9fu8])?
+        d.exchange(0xff))
+
+@test("SPI device: the README's multi-statement transaction compiles and answers")
+readme_example()
+    assert(read_id() == Ok(0xff))

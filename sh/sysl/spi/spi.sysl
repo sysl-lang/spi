@@ -8,11 +8,13 @@ enum Error derives Display
     Busy
     BadLength
 
+// Clock polarity and phase, numbered as every SPI datasheet numbers them:
+// M0 is CPOL=0 CPHA=0, M1 CPOL=0 CPHA=1, M2 CPOL=1 CPHA=0, M3 CPOL=1 CPHA=1.
 enum Mode
-    Mode0
-    Mode1
-    Mode2
-    Mode3
+    M0
+    M1
+    M2
+    M3
 
 enum BitOrder
     MsbFirst
@@ -23,13 +25,17 @@ struct Config derives Eq
     mode: Mode
     order: BitOrder
 
-config(hz: u32, mode: Mode = Mode.Mode0, order: BitOrder = BitOrder.MsbFirst) -> Config = Config(hz,mode,order)
+config(hz: u32, mode: Mode = Mode.M0, order: BitOrder = BitOrder.MsbFirst) -> Config = Config(hz,mode,order)
 
 // Eight-bit full duplex. Platforms select a rate no greater than config.hz,
 // reject unsupported settings, bound their hardware waits, and drain received
-// data even for writes. Bulk overrides can use DMA; caller buffers remain valid
-// only until the callback returns. No OS, allocator or locking policy is implied.
+// data even for writes. Bulk overrides can use DMA, but a transfer finishes
+// before its call returns: an implementation must not keep a caller's buffer.
+// No OS, allocator or locking policy is implied.
 trait Bus
+    // Called at every acquisition, since another device may have reconfigured a
+    // shared controller in between. A controller that already holds this exact
+    // configuration should make the call cheap.
     configure(*self, config: Config) -> Result[unit,Error]
     exchange(*self, byte: u8) -> Result[u8,Error]
     flush(*self) -> Result[unit,Error] = Ok(())
@@ -50,14 +56,27 @@ trait Bus
 trait ChipSelect
     set_active(*self, active: bool) -> Result[unit,Error]
 
-// A selected device transaction lasts from select(true) to select(false), not
-// merely one byte. exchange while deselected is intentionally permitted: SD
-// initialization and release clocks require it. Implementations must arbitrate
-// those clocks too. Device configuration is retained independently of its bus.
+// The first error of an operation and the cleanup that must follow it whatever
+// happened: the operation's error wins, and the cleanup's is reported only when
+// the operation succeeded.
+private finish[T](outcome: Result[T,Error], cleanup: Result[unit,Error]) -> Result[T,Error]
+    val value = outcome?
+    cleanup?
+    Ok(value)
+
+// A selected transaction lasts from select() to deselect(), not merely one
+// byte; transaction(op) is that bracket, deselecting whatever op returned.
+// exchange while deselected is intentionally permitted: SD initialization and
+// release clocks require it. Implementations must arbitrate those clocks too.
+// Device configuration is retained independently of its bus.
 trait Device
     configure(*self, config: Config) -> Result[unit,Error]
-    select(*self, active: bool) -> Result[unit,Error]
+    select(*self) -> Result[unit,Error]
+    deselect(*self) -> Result[unit,Error]
     exchange(*self, byte: u8) -> Result[u8,Error]
+    transaction[T](*self, op: (*Self) -> Result[T,Error]) -> Result[T,Error]
+        self.select()?
+        finish(op(self),self.deselect())
     read(*self, out: []u8, fill: u8 = 0xff) -> Result[unit,Error]
         for i in 0..<out.len do out[i] = self.exchange(fill)?
         Ok(())
@@ -69,87 +88,64 @@ trait Device
         for i in 0..<data.len do out[i] = self.exchange(data[i])?
         Ok(())
 
-struct Exclusive[B: Bus,C: ChipSelect]
+// A device behind its own chip-select pin on a bus it may share with others.
+// It holds bus arbitration for the whole span from select() to deselect(), and
+// for each deselected exchange or bulk call on its own. It supplies no mutex
+// or global locking policy: shared Bus handles synchronize the hardware.
+struct CsDevice[B: Bus,C: ChipSelect]
     private[spi] bus: B
     private[spi] cs: C
     private[spi] config: Config
     private[spi] active: bool
 
-// CS must initially be inactive. Shared Bus handles must synchronize access to
-// the underlying hardware; the defaults suit an exclusively owned controller.
-exclusive[B: Bus,C: ChipSelect](bus: B, cs: C, config: Config) -> Exclusive[B,C] = Exclusive(bus,cs,config,false)
+// CS must initially be inactive.
+device[B: Bus,C: ChipSelect](bus: B, cs: C, config: Config) -> CsDevice[B,C] = CsDevice(bus,cs,config,false)
 
-private begin[B: Bus,C: ChipSelect](d: *Exclusive[B,C]) -> Result[unit,Error]
+private begin[B: Bus,C: ChipSelect](d: *CsDevice[B,C]) -> Result[unit,Error]
     d.bus.acquire()?
-    val result = d.bus.configure(d.config)
-    if result.is_err() then d.bus.release()
-    result
+    val configured = d.bus.configure(d.config)
+    if configured.is_err() then d.bus.release()
+    configured
 
-impl[B: Bus,C: ChipSelect] Device for Exclusive[B,C]
+// One deselected bus call, bracketed by arbitration: the bus is flushed and
+// released whatever the call returned.
+private deselected[B: Bus,C: ChipSelect,T](d: *CsDevice[B,C], op: (*B) -> Result[T,Error]) -> Result[T,Error]
+    begin(d)?
+    val outcome = op(&d.bus)
+    val flushed = d.bus.flush()
+    finish(outcome,finish(flushed,d.bus.release()))
+
+impl[B: Bus,C: ChipSelect] Device for CsDevice[B,C]
     configure(*self, config: Config) -> Result[unit,Error]
         if self.active then return Err(Error.Busy)
         if config.hz == 0 then return Err(Error.Configuration)
         self.config = config
         Ok(())
-    select(*self, active: bool) -> Result[unit,Error]
-        if active
-            if self.active then return Ok(())
-            begin(self)?
-            val result = self.cs.set_active(true)
-            if result.is_err() then self.bus.release()
-            result?
-            self.active = true
-            return Ok(())
-        if !self.active
-            begin(self)?
+    // Selecting a selected device is a no-op; there is no nesting count.
+    select(*self) -> Result[unit,Error]
+        if self.active then return Ok(())
+        begin(self)?
+        val pin = self.cs.set_active(true)
+        if pin.is_err() then self.bus.release()
+        pin?
+        self.active = true
+        Ok(())
+    // Deselecting an inactive device still acquires the bus and drives CS
+    // inactive, so it doubles as a forced return to a known pin state.
+    deselect(*self) -> Result[unit,Error]
+        if !self.active then begin(self)?
         val flushed = self.bus.flush()
         val pin = self.cs.set_active(false)
         // `active` tracks bus ownership, which ends here whatever the pin did;
-        // select(true) likewise leaves it false when any step fails.
+        // select() likewise leaves it false when any step fails.
         self.active = false
-        val unlocked = self.bus.release()
-        flushed?
-        pin?
-        unlocked?
-        Ok(())
+        finish(flushed,finish(pin,self.bus.release()))
     exchange(*self, byte: u8) -> Result[u8,Error]
-        if self.active then return self.bus.exchange(byte)
-        begin(self)?
-        val result = self.bus.exchange(byte)
-        val flushed = self.bus.flush()
-        val unlocked = self.bus.release()
-        val value = result?
-        flushed?
-        unlocked?
-        Ok(value)
+        if self.active then self.bus.exchange(byte) else deselected(self,b -> b.exchange(byte))
     override read(*self, out: []u8, fill: u8) -> Result[unit,Error]
-        if self.active then return self.bus.read(out,fill)
-        begin(self)?
-        val result = self.bus.read(out,fill)
-        val flushed = self.bus.flush()
-        val unlocked = self.bus.release()
-        result?
-        flushed?
-        unlocked?
-        Ok(())
+        if self.active then self.bus.read(out,fill) else deselected(self,b -> b.read(out,fill))
     override write(*self, data: []const u8) -> Result[unit,Error]
-        if self.active then return self.bus.write(data)
-        begin(self)?
-        val result = self.bus.write(data)
-        val flushed = self.bus.flush()
-        val unlocked = self.bus.release()
-        result?
-        flushed?
-        unlocked?
-        Ok(())
+        if self.active then self.bus.write(data) else deselected(self,b -> b.write(data))
     override transfer(*self, data: []const u8, out: []u8) -> Result[unit,Error]
         if data.len != out.len then return Err(Error.BadLength)
-        if self.active then return self.bus.transfer(data,out)
-        begin(self)?
-        val result = self.bus.transfer(data,out)
-        val flushed = self.bus.flush()
-        val unlocked = self.bus.release()
-        result?
-        flushed?
-        unlocked?
-        Ok(())
+        if self.active then self.bus.transfer(data,out) else deselected(self,b -> b.transfer(data,out))
