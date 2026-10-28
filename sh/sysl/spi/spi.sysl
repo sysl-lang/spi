@@ -104,7 +104,9 @@ impl[B: Bus,C: ChipSelect] Device for Exclusive[B,C]
             begin(self)?
         val flushed = self.bus.flush()
         val pin = self.cs.set_active(false)
-        if pin.is_ok() then self.active = false
+        // `active` tracks bus ownership, which ends here whatever the pin did;
+        // select(true) likewise leaves it false when any step fails.
+        self.active = false
         val unlocked = self.bus.release()
         flushed?
         pin?
