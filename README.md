@@ -15,6 +15,14 @@ Bulk methods can be overridden with DMA. Transfers finish before callbacks retur
 settings specify a clock ceiling. Unsupported modes/orders must be rejected.
 Timing and part protocols belong to their driver packages.
 
-Development branch: `dev`; unreleased. Run `./scripts/gate.sh` for tests and five
+Release v0.1.0 is added with:
+
+```
+dependencies {
+  spi { git = "github.com/sysl-lang/spi", version = "0.1.0" }
+}
+```
+
+Development branch: `dev`. Run `./scripts/gate.sh` for tests and five
 instantiated freestanding builds. Hardware-controller implementations are supplied
 by the application; compile probes do not execute on target hardware.
