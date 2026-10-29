@@ -104,7 +104,9 @@ device[B: Bus,C: ChipSelect](bus: B, cs: C, config: Config) -> CsDevice[B,C] = C
 private begin[B: Bus,C: ChipSelect](d: *CsDevice[B,C]) -> Result[unit,Error]
     d.bus.acquire()?
     val configured = d.bus.configure(d.config)
-    if configured.is_err() then d.bus.release()
+    // The configuration error is the one reported; a release failure on this
+    // path would only hide it.
+    if configured.is_err() then _ = d.bus.release()
     configured
 
 // One deselected bus call, bracketed by arbitration: the bus is flushed and
@@ -126,7 +128,8 @@ impl[B: Bus,C: ChipSelect] Device for CsDevice[B,C]
         if self.active then return Ok(())
         begin(self)?
         val pin = self.cs.set_active(true)
-        if pin.is_err() then self.bus.release()
+        // The pin's error wins over a release failure on the same path.
+        if pin.is_err() then _ = self.bus.release()
         pin?
         self.active = true
         Ok(())

@@ -130,6 +130,36 @@ configure_fails()
     assert(d.exchange(1) == Err(Error.Configuration))
     assert(d.bus.acquired == 2 && d.bus.released == 2)
 
+struct ReleaseFails
+    released: int
+impl Bus for ReleaseFails
+    override release(*self) -> Result[unit,Error]
+        self.released += 1
+        Err(Error.Timeout)
+    configure(*self, config: Config) -> Result[unit,Error] = Err(Error.Configuration)
+    exchange(*self, byte: u8) -> Result[u8,Error] = Ok(byte)
+
+@test("SPI device: a failed release on a failed configuration does not hide the configuration error")
+configure_fails_release_fails()
+    var d = device(ReleaseFails(0),TestPin(false),config(1000000))
+    assert(d.select() == Err(Error.Configuration) && !d.active)
+    assert(d.bus.released == 1)
+
+struct PinFailsReleaseFails
+    released: int
+impl Bus for PinFailsReleaseFails
+    override release(*self) -> Result[unit,Error]
+        self.released += 1
+        Err(Error.Timeout)
+    configure(*self, config: Config) -> Result[unit,Error] = Ok(())
+    exchange(*self, byte: u8) -> Result[u8,Error] = Ok(byte)
+
+@test("SPI device: a failed release after a failed chip-select pin reports the pin error")
+pin_fails_release_fails()
+    var d = device(PinFailsReleaseFails(0),FlakyPin(false,1,0),config(1000000))
+    assert(d.select() == Err(Error.Io) && !d.active && !d.cs.active)
+    assert(d.bus.released == 1)
+
 struct FlakyPin
     active: bool
     fail_on: int
