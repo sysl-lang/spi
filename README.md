@@ -6,7 +6,7 @@ implement `Bus` and `ChipSelect`; part drivers use `Device`.
 
 ```
 dependencies {
-  spi { git = "github.com/sysl-lang/spi", version = "0.2.0" }
+  spi { git = "github.com/sysl-lang/spi", version = "0.2.1" }
 }
 ```
 

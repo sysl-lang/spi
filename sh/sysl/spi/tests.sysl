@@ -125,7 +125,7 @@ impl Bus for ConfigFails
 
 @test("SPI device: a configuration the bus refuses releases the bus and never asserts CS")
 configure_fails()
-    var d = device(ConfigFails(0,0),TestPin(false),config(1000000))
+    var d = device(ConfigFails(acquired = 0, released = 0),TestPin(false),config(1000000))
     assert(d.select() == Err(Error.Configuration) && !d.active && !d.cs.active)
     assert(d.exchange(1) == Err(Error.Configuration))
     assert(d.bus.acquired == 2 && d.bus.released == 2)
@@ -156,7 +156,7 @@ impl Bus for PinFailsReleaseFails
 
 @test("SPI device: a failed release after a failed chip-select pin reports the pin error")
 pin_fails_release_fails()
-    var d = device(PinFailsReleaseFails(0),FlakyPin(false,1,0),config(1000000))
+    var d = device(PinFailsReleaseFails(0),FlakyPin(active = false, fail_on = 1, calls = 0),config(1000000))
     assert(d.select() == Err(Error.Io) && !d.active && !d.cs.active)
     assert(d.bus.released == 1)
 
@@ -170,7 +170,7 @@ impl ChipSelect for FlakyPin
         if self.fail_on == self.calls then return Err(Error.Io)
         self.active = active
         Ok(())
-private flaky(fail_on: int) -> CsDevice[TestBus,FlakyPin] = device(test_bus(),FlakyPin(false,fail_on,0),config(1000000))
+private flaky(fail_on: int) -> CsDevice[TestBus,FlakyPin] = device(test_bus(),FlakyPin(active = false, fail_on = fail_on, calls = 0),config(1000000))
 
 @test("SPI device: a failed deselect leaves the device inactive and the bus released")
 deselect_pin_fails()
@@ -237,12 +237,16 @@ transaction_deselect_fails()
 
 // Two devices on one shared bus, each with its own pin. The handle is a
 // pointer to the one controller, so each device holds a copy of the pointer.
+// The controller reprograms its registers only when the configuration changes,
+// which is what keeps CsDevice's configure-at-every-acquisition cheap.
 struct SharedBus
     owner: int
     acquired: int
     released: int
     clocks: int
     current: Config
+    programmed: int
+private idle_controller() -> SharedBus = SharedBus(owner = 0, acquired = 0, released = 0, clocks = 0, current = config(1), programmed = 0)
 struct Handle
     bus: *SharedBus
     id: int
@@ -259,7 +263,9 @@ impl Bus for Handle
         Ok(())
     configure(*self, config: Config) -> Result[unit,Error]
         assert(self.bus.owner == self.id)
-        self.bus.current = config
+        if self.bus.current != config
+            self.bus.current = config
+            self.bus.programmed += 1
         Ok(())
     exchange(*self, byte: u8) -> Result[u8,Error]
         assert(self.bus.owner == self.id)
@@ -268,9 +274,9 @@ impl Bus for Handle
 
 @test("SPI device: two devices share a bus and arbitrate by acquire and release")
 shared_bus()
-    var shared = SharedBus(0,0,0,0,config(1))
-    var a = device(Handle(&shared,1),TestPin(false),config(1000000))
-    var b = device(Handle(&shared,2),TestPin(false),config(1000000))
+    var shared = idle_controller()
+    var a = device(Handle(bus = &shared, id = 1),TestPin(false),config(1000000))
+    var b = device(Handle(bus = &shared, id = 2),TestPin(false),config(1000000))
     a.select().unwrap()
     assert(shared.owner == 1 && b.exchange(1) == Err(Error.Busy) && b.select() == Err(Error.Busy))
     assert(!b.active && !b.cs.active && shared.owner == 1)
@@ -284,11 +290,11 @@ shared_bus()
 
 @test("SPI device: each device's clock, mode and order are restored whenever it takes the shared bus")
 shared_bus_configs()
-    var shared = SharedBus(0,0,0,0,config(1))
+    var shared = idle_controller()
     val slow = config(400000,Mode.M3,BitOrder.LsbFirst)
     val fast = config(8000000)
-    var a = device(Handle(&shared,1),TestPin(false),slow)
-    var b = device(Handle(&shared,2),TestPin(false),fast)
+    var a = device(Handle(bus = &shared, id = 1),TestPin(false),slow)
+    var b = device(Handle(bus = &shared, id = 2),TestPin(false),fast)
     a.select().unwrap()
     assert(shared.current == slow)
     a.deselect().unwrap()
@@ -298,6 +304,23 @@ shared_bus_configs()
     assert(shared.current == slow)
     b.transaction(t -> t.write([1u8,2])).unwrap()
     assert(shared.current == fast && shared.owner == 0 && shared.clocks == 4)
+
+@test("SPI device: deselected bytes from one device reconfigure a caching controller once")
+repeated_deselected_bytes()
+    var shared = idle_controller()
+    var a = device(Handle(bus = &shared, id = 1),TestPin(false),config(400000))
+    var b = device(Handle(bus = &shared, id = 2),TestPin(false),config(8000000))
+    for _ in 0..<5 do a.exchange(0xff).unwrap()
+    assert(shared.acquired == 5 && shared.released == 5 && shared.programmed == 1)
+    a.transaction(t -> t.exchange(1)).unwrap()
+    assert(shared.programmed == 1 && shared.current == config(400000))
+    b.exchange(0xff).unwrap()
+    a.exchange(0xff).unwrap()
+    assert(shared.programmed == 3 && shared.current == config(400000) && shared.owner == 0)
+    a.configure(config(1000000)).unwrap()
+    assert(shared.programmed == 3)
+    a.exchange(0xff).unwrap()
+    assert(shared.programmed == 4 && shared.current == config(1000000))
 
 // The README's example, as written there.
 struct Controller
